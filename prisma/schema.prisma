@@ -1,0 +1,136 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  ADMIN
+  CUSTOMER
+}
+
+enum UserStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  IN_PRODUCTION
+  BAKED
+  COMPLETED
+}
+
+model User {
+  id             String          @id @default(uuid())
+  name           String
+  email          String          @unique
+  password       String?         // Nullable for Google OAuth users
+  role           Role            @default(CUSTOMER)
+  status         UserStatus      @default(PENDING)
+  phone          String?         // For WhatsApp deep-linking alerts
+  createdAt      DateTime        @default(now())
+  orders         Order[]
+  standingOrders StandingOrder[]
+}
+
+model Product {
+  id          String              @id @default(uuid())
+  name        String
+  description String
+  active      Boolean             @default(true)
+  variants    ProductVariant[]
+  menuItems   WeeklyMenuProduct[]
+}
+
+model ProductVariant {
+  id             String          @id @default(uuid())
+  productId      String
+  product        Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  size           String          // Small, Medium, Large, Custom etc.
+  price          Float           @default(0.0)
+  recipe         Recipe?
+  orderItems     OrderItem[]
+  standingOrders StandingOrder[]
+}
+
+model Recipe {
+  id               String         @id @default(uuid())
+  variantId        String         @unique
+  variant          ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  flour            Float          @default(0.0) // grams
+  water            Float          @default(0.0) // grams
+  salt             Float          @default(0.0) // grams
+  starter          Float          @default(0.0) // grams
+  starterName      String?        @default("default")
+  extraIngredients Json?          // Array of { name: string, grams: number }
+  floursBreakdown  Json?          // Array of { name: string, percentage: number }
+}
+
+model WeeklyMenu {
+  id            String              @id @default(uuid())
+  weekStartDate DateTime            @unique // Unique week starting date (e.g. normalized to Monday)
+  products      WeeklyMenuProduct[]
+}
+
+model WeeklyMenuProduct {
+  id           String     @id @default(uuid())
+  weeklyMenuId String
+  weeklyMenu   WeeklyMenu @relation(fields: [weeklyMenuId], references: [id], onDelete: Cascade)
+  productId    String
+  product      Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([weeklyMenuId, productId])
+}
+
+model Order {
+  id         String      @id @default(uuid())
+  userId     String
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status     OrderStatus @default(PENDING)
+  pickupSlot String?     // Saturday 09:00 - 10:30, Sunday 10:00 - 12:00 etc.
+  createdAt  DateTime    @default(now())
+  items      OrderItem[]
+  batchId    String?
+  batch      Batch?      @relation(fields: [batchId], references: [id], onDelete: SetNull)
+}
+
+model OrderItem {
+  id               String         @id @default(uuid())
+  orderId          String
+  order            Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productVariantId String
+  productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  quantity         Int
+  couponApplied    Int            @default(0)
+}
+
+model Batch {
+  id        String      @id @default(uuid())
+  date      DateTime    @default(now())
+  status    String      @default("DRAFT") // DRAFT, LOCKED
+  orders    Order[]
+}
+
+model StandingOrder {
+  id               String         @id @default(uuid())
+  userId           String
+  user             User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productVariantId String
+  productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  quantity         Int            @default(1)
+  pickupSlot       String         // Repeating pickup slot chosen
+  active           Boolean        @default(true)
+  createdAt        DateTime       @default(now())
+}
+
+model Setting {
+  key   String @id
+  value String
+}
+
