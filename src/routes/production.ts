@@ -669,4 +669,213 @@ router.delete('/batches/:id', authenticateToken, requireAdmin, async (req: Authe
   }
 });
 
+// 7. Sales Forecasting and Ingredient Planning
+router.get('/forecast', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  const days = parseInt(req.query.days as string || '14', 10);
+  
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const limitDate = new Date();
+    limitDate.setDate(today.getDate() + days);
+    limitDate.setHours(23, 59, 59, 999);
+
+    // 1. Get all batches scheduled in this range (today to limitDate)
+    const batches = await prisma.batch.findMany({
+      where: {
+        date: {
+          gte: today,
+          lte: limitDate,
+        }
+      },
+      include: {
+        orders: {
+          include: {
+            items: {
+              include: {
+                productVariant: {
+                  include: {
+                    product: true,
+                    recipe: true,
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // 2. Get any unbatched draft/pending/confirmed orders in this range
+    const unbatchedOrders = await prisma.order.findMany({
+      where: {
+        batchId: null,
+        status: { in: ['PENDING', 'CONFIRMED'] },
+        createdAt: {
+          gte: today,
+          lte: limitDate,
+        }
+      },
+      include: {
+        items: {
+          include: {
+            productVariant: {
+              include: {
+                product: true,
+                recipe: true,
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // 3. Get active subscriptions (Standing Orders)
+    const standingOrders = await prisma.standingOrder.findMany({
+      where: { active: true },
+      include: {
+        productVariant: {
+          include: {
+            product: true,
+            recipe: true,
+          }
+        }
+      }
+    });
+
+    // Let's aggregate product quantities: productVariantId -> { productVariant, quantity }
+    const productAggregates: Record<string, { productVariant: any; quantity: number }> = {};
+
+    const addProducts = (variant: any, qty: number) => {
+      if (!variant) return;
+      if (!productAggregates[variant.id]) {
+        productAggregates[variant.id] = { productVariant: variant, quantity: 0 };
+      }
+      productAggregates[variant.id].quantity += qty;
+    };
+
+    // Add items from batched orders
+    batches.forEach(b => {
+      b.orders.forEach(o => {
+        o.items.forEach(item => {
+          addProducts(item.productVariant, item.quantity);
+        });
+      });
+    });
+
+    // Add items from unbatched orders
+    unbatchedOrders.forEach(o => {
+      o.items.forEach(item => {
+        addProducts(item.productVariant, item.quantity);
+      });
+    });
+
+    // Add projected standing orders
+    // If we forecast X days, that corresponds to (days / 7) weeks.
+    const weeksFactor = Math.max(1, days / 7);
+    standingOrders.forEach(so => {
+      const projectedQty = Math.round(so.quantity * weeksFactor);
+      addProducts(so.productVariant, projectedQty);
+    });
+
+    // Now, run the calculations on aggregated product variations
+    let totalFlour = 0;
+    let totalWater = 0;
+    let totalSalt = 0;
+    let totalStarter = 0;
+    const extraIngredientsMap: Record<string, number> = {};
+    const floursBreakdownMap: Record<string, number> = {};
+    const productQuantities: Array<{ productName: string; size: string; quantity: number }> = [];
+
+    Object.values(productAggregates).forEach(({ productVariant, quantity }) => {
+      if (quantity <= 0) return;
+      
+      productQuantities.push({
+        productName: productVariant.product.name,
+        size: productVariant.size,
+        quantity,
+      });
+
+      const recipe = productVariant.recipe;
+      if (!recipe) return;
+
+      const scale = quantity;
+      totalFlour += (recipe.flour || 0) * scale;
+      totalWater += (recipe.water || 0) * scale;
+      totalSalt += (recipe.salt || 0) * scale;
+      totalStarter += (recipe.starter || 0) * scale;
+
+      // Extra Ingredients breakdown
+      if (recipe.extraIngredients) {
+        let extras: any[] = [];
+        try {
+          extras = typeof recipe.extraIngredients === 'string' 
+            ? JSON.parse(recipe.extraIngredients) 
+            : recipe.extraIngredients as any[];
+        } catch (e) {
+          extras = [];
+        }
+        if (Array.isArray(extras)) {
+          extras.forEach((ext: any) => {
+            if (ext.name && ext.grams) {
+              const name = ext.name.trim();
+              extraIngredientsMap[name] = (extraIngredientsMap[name] || 0) + ext.grams * scale;
+            }
+          });
+        }
+      }
+
+      // Flour types breakdown
+      if (recipe.floursBreakdown) {
+        let flours: any[] = [];
+        try {
+          flours = typeof recipe.floursBreakdown === 'string'
+            ? JSON.parse(recipe.floursBreakdown)
+            : recipe.floursBreakdown as any[];
+        } catch (e) {
+          flours = [];
+        }
+        if (Array.isArray(flours)) {
+          flours.forEach((fl: any) => {
+            if (fl.name && fl.percentage) {
+              const name = fl.name.trim();
+              const weight = (recipe.flour || 0) * (fl.percentage / 100) * scale;
+              floursBreakdownMap[name] = (floursBreakdownMap[name] || 0) + weight;
+            }
+          });
+        }
+      } else {
+        // Fallback to "Manitoba" if no specific breakdown is set
+        const defaultFlourName = 'Manitoba';
+        const weight = (recipe.flour || 0) * scale;
+        floursBreakdownMap[defaultFlourName] = (floursBreakdownMap[defaultFlourName] || 0) + weight;
+      }
+    });
+
+    // If floursBreakdownMap is empty but totalFlour > 0, fallback to Manitoba
+    if (Object.keys(floursBreakdownMap).length === 0 && totalFlour > 0) {
+      floursBreakdownMap['Manitoba'] = totalFlour;
+    }
+
+    return res.json({
+      days,
+      batchesCount: batches.length,
+      ordersCount: batches.reduce((sum, b) => sum + b.orders.length, 0) + unbatchedOrders.length,
+      subscriptionsCount: standingOrders.length,
+      productQuantities,
+      summary: {
+        totalFlour,
+        totalWater,
+        totalSalt,
+        totalStarter,
+        floursBreakdown: Object.entries(floursBreakdownMap).map(([name, grams]) => ({ name, grams })),
+        extrasBreakdown: Object.entries(extraIngredientsMap).map(([name, grams]) => ({ name, grams })),
+      }
+    });
+  } catch (error) {
+    console.error('Error in forecasting:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 export default router;

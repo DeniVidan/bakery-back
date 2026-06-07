@@ -532,4 +532,37 @@ router.delete('/:id', authenticateToken, requireApproved, async (req: Authentica
   }
 });
 
+// GET /api/orders/:id/metadata - Fetch metadata for an order
+router.get('/:id/metadata', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const metaKey = `order_meta:${id}`;
+    const setting = await prisma.setting.findUnique({
+      where: { key: metaKey }
+    });
+    return res.json(setting ? JSON.parse(setting.value) : {});
+  } catch (error) {
+    console.error('Error fetching order metadata:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/orders/:id/metadata - Update metadata for an order
+router.post('/:id/metadata', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const metadata = req.body;
+  try {
+    const metaKey = `order_meta:${id}`;
+    await prisma.setting.upsert({
+      where: { key: metaKey },
+      update: { value: JSON.stringify(metadata) },
+      create: { key: metaKey, value: JSON.stringify(metadata) }
+    });
+    return res.json({ message: 'Metadata updated successfully', metadata });
+  } catch (error) {
+    console.error('Error updating order metadata:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 export default router;

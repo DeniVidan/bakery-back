@@ -44,8 +44,15 @@ router.get('/status', authenticateToken, requireApproved, async (req: Authentica
       orderBy: { createdAt: 'desc' }
     });
 
+    // Fetch manual offline stamps from settings model
+    const manualKey = `loyalty_manual:${targetUserId}`;
+    const manualSetting = await prisma.setting.findUnique({
+      where: { key: manualKey }
+    });
+    const manualItems = manualSetting ? parseInt(manualSetting.value, 10) : 0;
+
     // Calculate total items bought
-    let totalItemsBought = 0;
+    let totalItemsBought = manualItems;
     const purchaseLedger: Array<{
       orderId: string;
       date: Date;
@@ -127,7 +134,13 @@ router.get('/admin', authenticateToken, requireAdmin, async (req: AuthenticatedR
         }
       });
 
-      let totalItemsBought = 0;
+      const manualKey = `loyalty_manual:${customer.id}`;
+      const manualSetting = await prisma.setting.findUnique({
+        where: { key: manualKey }
+      });
+      const manualItems = manualSetting ? parseInt(manualSetting.value, 10) : 0;
+
+      let totalItemsBought = manualItems;
       completedOrders.forEach(order => {
         order.items.forEach(item => {
           totalItemsBought += item.quantity - (item.couponApplied || 0);
@@ -191,7 +204,13 @@ router.post('/redeem', authenticateToken, requireAdmin, async (req: Authenticate
       }
     });
 
-    let totalItemsBought = 0;
+    const manualKey = `loyalty_manual:${userId}`;
+    const manualSetting = await prisma.setting.findUnique({
+      where: { key: manualKey }
+    });
+    const manualItems = manualSetting ? parseInt(manualSetting.value, 10) : 0;
+
+    let totalItemsBought = manualItems;
     completedOrders.forEach(order => {
       order.items.forEach(item => {
         totalItemsBought += item.quantity;
@@ -230,6 +249,45 @@ router.post('/redeem', authenticateToken, requireAdmin, async (req: Authenticate
     });
   } catch (error) {
     console.error('Error redeeming loyalty loaf:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/loyalty/adjust-manual - Manually adjust a customer's offline stamps (Admin only)
+router.post('/adjust-manual', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  const { userId, adjustment } = req.body;
+  if (!userId || typeof adjustment !== 'number') {
+    return res.status(400).json({ error: 'User ID and numeric adjustment are required' });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const manualKey = `loyalty_manual:${userId}`;
+    const manualSetting = await prisma.setting.findUnique({
+      where: { key: manualKey }
+    });
+    const currentManualCount = manualSetting ? parseInt(manualSetting.value, 10) : 0;
+    const nextManualCount = Math.max(0, currentManualCount + adjustment);
+
+    await prisma.setting.upsert({
+      where: { key: manualKey },
+      update: { value: String(nextManualCount) },
+      create: { key: manualKey, value: String(nextManualCount) }
+    });
+
+    return res.json({
+      message: `Successfully adjusted manual offline count by ${adjustment}!`,
+      manualItemsCount: nextManualCount
+    });
+  } catch (error) {
+    console.error('Error adjusting manual loyalty:', error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
