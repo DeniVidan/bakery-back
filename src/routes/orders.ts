@@ -308,9 +308,9 @@ router.put('/:id/status', authenticateToken, requireAdmin, async (req: Authentic
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    // 1. Immutable batch lock safeguard
-    if (existingOrder.batch && existingOrder.batch.status === 'LOCKED') {
-      return res.status(400).json({ error: 'Cannot modify the status of an order belonging to a locked production batch.' });
+    // 1. Immutable batch lock safeguard (Admins can bypass)
+    if (existingOrder.batch && existingOrder.batch.status !== 'DRAFT' && req.user?.role !== 'ADMIN') {
+      return res.status(400).json({ error: 'Cannot modify the status of an order belonging to an active production batch.' });
     }
 
     // 2. Strict State Machine validation: PENDING → CONFIRMED → IN_PRODUCTION → BAKED → COMPLETED
@@ -371,8 +371,8 @@ router.put('/:id', authenticateToken, requireAdmin, async (req: AuthenticatedReq
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    // Immutable batch lock safeguard for existing batch
-    if (existingOrder.batch && existingOrder.batch.status === 'LOCKED') {
+    // Immutable batch lock safeguard for existing batch (Admins can bypass)
+    if (existingOrder.batch && existingOrder.batch.status === 'LOCKED' && req.user?.role !== 'ADMIN') {
       return res.status(400).json({ error: 'Cannot modify details of an order belonging to a locked production batch.' });
     }
 
@@ -386,8 +386,8 @@ router.put('/:id', authenticateToken, requireAdmin, async (req: AuthenticatedReq
         
         const matchingBatch = await prisma.batch.findUnique({ where: { id: newBatchId } });
         if (matchingBatch) {
-          // If the matching target batch is locked, block moving to it
-          if (matchingBatch.status === 'LOCKED') {
+          // If the matching target batch is locked, block moving to it (Admins can bypass)
+          if (matchingBatch.status === 'LOCKED' && req.user?.role !== 'ADMIN') {
             return res.status(400).json({ error: 'Cannot move an order to a locked production batch.' });
           }
           // Default status scaling
@@ -407,7 +407,7 @@ router.put('/:id', authenticateToken, requireAdmin, async (req: AuthenticatedReq
       updateData.batchId = batchId;
       if (batchId) {
         const targetBatch = await prisma.batch.findUnique({ where: { id: batchId } });
-        if (targetBatch && targetBatch.status === 'LOCKED') {
+        if (targetBatch && targetBatch.status === 'LOCKED' && req.user?.role !== 'ADMIN') {
           return res.status(400).json({ error: 'Cannot move an order to a locked production batch.' });
         }
       }
@@ -493,8 +493,8 @@ router.delete('/:id', authenticateToken, requireApproved, async (req: Authentica
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    // Immutable batch lock safeguard
-    if (order.batch && order.batch.status === 'LOCKED') {
+    // Immutable batch lock safeguard (Admins can bypass)
+    if (order.batch && order.batch.status === 'LOCKED' && req.user.role !== 'ADMIN') {
       return res.status(400).json({ error: 'Cannot cancel or delete an order belonging to a locked production batch.' });
     }
 

@@ -23,6 +23,14 @@ router.get('/calculations', authenticateToken, requireAdmin, async (req: Authent
   const { week, batchId, orderIds } = req.query;
 
   try {
+    // Fetch doughWasteFactor from settings
+    const doughWasteSetting = await prisma.setting.findUnique({
+      where: { key: 'doughWasteFactor' },
+    });
+    const doughWasteFactorStr = doughWasteSetting?.value;
+    const doughWasteFactor = (doughWasteFactorStr && !isNaN(parseFloat(doughWasteFactorStr))) ? parseFloat(doughWasteFactorStr) : 5; // default 5%
+    const multiplier = 1 + (doughWasteFactor / 100);
+
     let ordersToProcess: any[] = [];
 
     if (orderIds) {
@@ -126,15 +134,16 @@ router.get('/calculations', authenticateToken, requireAdmin, async (req: Authent
           continue;
         }
 
-        const flourWeightForThisItem = recipe.flour * qty;
+        const scaledQty = qty * multiplier;
+        const flourWeightForThisItem = recipe.flour * scaledQty;
 
         // Add to main totals
-        totalFlour += recipe.flour * qty;
-        totalWater += recipe.water * qty;
-        totalSalt += recipe.salt * qty;
-        totalStarter += recipe.starter * qty;
+        totalFlour += recipe.flour * scaledQty;
+        totalWater += recipe.water * scaledQty;
+        totalSalt += recipe.salt * scaledQty;
+        totalStarter += recipe.starter * scaledQty;
         const sName = (!recipe.starterName || recipe.starterName === 'default') ? 'Standard Sourdough Starter' : recipe.starterName;
-        startersMap[sName] = (startersMap[sName] || 0) + recipe.starter * qty;
+        startersMap[sName] = (startersMap[sName] || 0) + recipe.starter * scaledQty;
 
         // Process flours breakdown
         let floursBreakdown: any[] = [];
@@ -174,7 +183,7 @@ router.get('/calculations', authenticateToken, requireAdmin, async (req: Authent
         if (Array.isArray(extras)) {
           for (const extra of extras) {
             if (extra && extra.name && typeof extra.grams === 'number') {
-              extraIngredientsMap[extra.name] = (extraIngredientsMap[extra.name] || 0) + extra.grams * qty;
+              extraIngredientsMap[extra.name] = (extraIngredientsMap[extra.name] || 0) + extra.grams * scaledQty;
             }
           }
         }
@@ -196,26 +205,26 @@ router.get('/calculations', authenticateToken, requireAdmin, async (req: Authent
 
         const pb = productBreakdown[variant.id];
         pb.quantity += qty;
-        pb.flour += recipe.flour * qty;
-        pb.water += recipe.water * qty;
-        pb.salt += recipe.salt * qty;
-        pb.starter += recipe.starter * qty;
+        pb.flour += recipe.flour * scaledQty;
+        pb.water += recipe.water * scaledQty;
+        pb.salt += recipe.salt * scaledQty;
+        pb.starter += recipe.starter * scaledQty;
 
         if (Array.isArray(floursBreakdown) && floursBreakdown.length > 0) {
           for (const fb of floursBreakdown) {
             if (fb && fb.name && typeof fb.percentage === 'number') {
-              const fbWeight = (fb.percentage / 100) * (recipe.flour * qty);
+              const fbWeight = (fb.percentage / 100) * (recipe.flour * scaledQty);
               pb.floursBreakdown[fb.name] = (pb.floursBreakdown[fb.name] || 0) + fbWeight;
             }
           }
         } else {
-          pb.floursBreakdown['Bread Flour'] = (pb.floursBreakdown['Bread Flour'] || 0) + (recipe.flour * qty);
+          pb.floursBreakdown['Bread Flour'] = (pb.floursBreakdown['Bread Flour'] || 0) + (recipe.flour * scaledQty);
         }
 
         if (Array.isArray(extras)) {
           for (const extra of extras) {
             if (extra && extra.name && typeof extra.grams === 'number') {
-              pb.extraIngredients[extra.name] = (pb.extraIngredients[extra.name] || 0) + extra.grams * qty;
+              pb.extraIngredients[extra.name] = (pb.extraIngredients[extra.name] || 0) + extra.grams * scaledQty;
             }
           }
         }
@@ -581,50 +590,91 @@ async function adjustPantryStockForBatch(batchId: string, action: 'deduct' | 're
   }
 }
 
-// 5. Toggle lock batch status
+// 5. Toggle lock batch status (Backward compatibility)
 router.put('/batches/:id/lock', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const { lock } = req.body; // boolean
+  const targetStatus = lock ? 'IN_PRODUCTION' : 'DRAFT';
+  
+  // Re-route to status updating logic
+  req.body = { status: targetStatus };
+  return updateBatchStatus(req, res);
+});
+
+// Helper function for batch status transitions
+async function updateBatchStatus(req: AuthenticatedRequest, res: Response) {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  const allowedStatuses = ['DRAFT', 'IN_PRODUCTION', 'BAKED', 'COMPLETED', 'LOCKED'];
+  if (!status || !allowedStatuses.includes(status)) {
+    return res.status(400).json({ error: 'Valid batch status is required' });
+  }
 
   try {
-    const updatedBatch = await prisma.batch.update({
+    const existingBatch = await prisma.batch.findUnique({
       where: { id },
-      data: {
-        status: lock ? 'LOCKED' : 'DRAFT',
-      },
     });
 
-    // If locked, we move all linked orders to IN_PRODUCTION. If unlocked, we revert them to CONFIRMED.
-    if (lock) {
+    if (!existingBatch) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+
+    const oldStatus = existingBatch.status;
+
+    // Determine target order status based on batch status
+    let targetOrderStatus: string | null = null;
+    if (status === 'IN_PRODUCTION' || status === 'LOCKED') {
+      targetOrderStatus = 'IN_PRODUCTION';
+    } else if (status === 'BAKED') {
+      targetOrderStatus = 'BAKED';
+    } else if (status === 'COMPLETED') {
+      targetOrderStatus = 'COMPLETED';
+    } else if (status === 'DRAFT') {
+      targetOrderStatus = 'CONFIRMED';
+    }
+
+    // Update batch
+    const updatedBatch = await prisma.batch.update({
+      where: { id },
+      data: { status },
+    });
+
+    if (targetOrderStatus) {
+      // Update all linked orders in bulk
       await prisma.order.updateMany({
         where: { batchId: id },
-        data: { status: 'IN_PRODUCTION' },
+        data: { status: targetOrderStatus as any },
       });
-      // Deduct inventory stock for the batch
+    }
+
+    // Deduct/Restore inventory based on transitioning to/from deducted statuses (BAKED or LOCKED)
+    const isDeductedStatus = (s: string) => s === 'BAKED' || s === 'LOCKED';
+    const oldDeducted = isDeductedStatus(oldStatus);
+    const newDeducted = isDeductedStatus(status);
+
+    if (newDeducted && !oldDeducted) {
       await adjustPantryStockForBatch(id, 'deduct');
-    } else {
-      await prisma.order.updateMany({
-        where: { 
-          batchId: id,
-          status: 'IN_PRODUCTION'
-        },
-        data: { status: 'CONFIRMED' },
-      });
-      // Restore inventory stock for the batch
+    } else if (!newDeducted && oldDeducted) {
       await adjustPantryStockForBatch(id, 'restore');
     }
 
     return res.json({
-      message: `Batch status has been successfully updated to ${lock ? 'LOCKED' : 'DRAFT'}`,
+      message: `Batch status has been successfully updated to ${status}`,
       batch: updatedBatch,
     });
   } catch (error) {
-    console.error('Error locking batch:', error);
+    console.error('Error updating batch status:', error);
     return res.status(500).json({ error: 'Internal server error' });
   }
+}
+
+// 5.5 Generic batch status transition
+router.put('/batches/:id/status', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  return updateBatchStatus(req, res);
 });
 
-// 6. Delete a batch (Unbatches all orders and reverts IN_PRODUCTION status to CONFIRMED)
+// 6. Delete a batch (Unbatches all orders and reverts active production order statuses to CONFIRMED)
 router.delete('/batches/:id', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
 
@@ -633,16 +683,17 @@ router.delete('/batches/:id', authenticateToken, requireAdmin, async (req: Authe
       where: { id },
     });
 
-    if (batchToDelete && batchToDelete.status === 'LOCKED') {
-      // Restore inventory stock if deleting a locked batch
+    const isDeductedStatus = (s: string) => s === 'BAKED' || s === 'LOCKED';
+    if (batchToDelete && isDeductedStatus(batchToDelete.status)) {
+      // Restore inventory stock if deleting an active/deducted batch
       await adjustPantryStockForBatch(id, 'restore');
     }
 
-    // 1. Revert order statuses from IN_PRODUCTION back to CONFIRMED
+    // 1. Revert order statuses back to CONFIRMED
     await prisma.order.updateMany({
       where: {
         batchId: id,
-        status: 'IN_PRODUCTION',
+        status: { in: ['IN_PRODUCTION', 'BAKED', 'COMPLETED'] },
       },
       data: {
         status: 'CONFIRMED',
@@ -674,6 +725,13 @@ router.get('/forecast', authenticateToken, requireAdmin, async (req: Authenticat
   const days = parseInt(req.query.days as string || '14', 10);
   
   try {
+    // Fetch doughWasteFactor from settings
+    const doughWasteSetting = await prisma.setting.findUnique({
+      where: { key: 'doughWasteFactor' },
+    });
+    const doughWasteFactorStr = doughWasteSetting?.value;
+    const doughWasteFactor = (doughWasteFactorStr && !isNaN(parseFloat(doughWasteFactorStr))) ? parseFloat(doughWasteFactorStr) : 5; // default 5%
+    const multiplier = 1 + (doughWasteFactor / 100);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const limitDate = new Date();
@@ -799,7 +857,7 @@ router.get('/forecast', authenticateToken, requireAdmin, async (req: Authenticat
       const recipe = productVariant.recipe;
       if (!recipe) return;
 
-      const scale = quantity;
+      const scale = quantity * multiplier;
       totalFlour += (recipe.flour || 0) * scale;
       totalWater += (recipe.water || 0) * scale;
       totalSalt += (recipe.salt || 0) * scale;
