@@ -166,6 +166,13 @@ router.post('/', authenticateToken, requireApproved, async (req: AuthenticatedRe
         });
       }
 
+      // 2.5 Search by name case-insensitively if not found by email or phone
+      if (!customerUser && name) {
+        customerUser = await prisma.user.findFirst({
+          where: { name: { equals: name, mode: 'insensitive' } }
+        });
+      }
+
       // 3. Create if not exists
       if (!customerUser) {
         const safeEmail = email || `internal_${Date.now()}_${Math.floor(Math.random() * 1000)}@internal.bakery.com`;
@@ -185,6 +192,13 @@ router.post('/', authenticateToken, requireApproved, async (req: AuthenticatedRe
           customerUser = await prisma.user.update({
             where: { id: customerUser.id },
             data: { phone }
+          });
+        }
+        // Update email if provided but missing (and not the auto-generated internal email)
+        if (email && (!customerUser.email || customerUser.email.endsWith('@internal.bakery.com'))) {
+          customerUser = await prisma.user.update({
+            where: { id: customerUser.id },
+            data: { email }
           });
         }
       }
