@@ -67,32 +67,65 @@ router.get('/calculations', authenticateToken, requireAdmin, async (req: Authent
         },
       });
     } else {
-      // Default to the current week's orders if nothing specified
-      const targetMonday = getMondayOfDate(week as string);
-      const nextMonday = new Date(targetMonday);
-      nextMonday.setDate(targetMonday.getDate() + 7);
-
-      ordersToProcess = await prisma.order.findMany({
+      // Look for the next active scheduled batch (where status is DRAFT, IN_PRODUCTION, or LOCKED) on or after today
+      const nextBatch = await prisma.batch.findFirst({
         where: {
-          createdAt: {
-            gte: targetMonday,
-            lt: nextMonday,
+          status: { in: ['DRAFT', 'IN_PRODUCTION', 'LOCKED'] },
+          date: {
+            gte: new Date(new Date().setHours(0, 0, 0, 0)),
           },
-          status: { in: ['PENDING', 'CONFIRMED', 'IN_PRODUCTION', 'BAKED'] },
         },
-        include: {
-          items: {
-            include: {
-              productVariant: {
-                include: {
-                  product: true,
-                  recipe: true,
+        orderBy: {
+          date: 'asc',
+        },
+      });
+
+      if (nextBatch) {
+        ordersToProcess = await prisma.order.findMany({
+          where: {
+            batchId: nextBatch.id,
+          },
+          include: {
+            items: {
+              include: {
+                productVariant: {
+                  include: {
+                    product: true,
+                    recipe: true,
+                  },
                 },
               },
             },
           },
-        },
-      });
+        });
+      } else {
+        // Fallback: Default to the current week's orders if nothing specified and no upcoming batch found
+        const targetMonday = getMondayOfDate(week as string);
+        const nextMonday = new Date(targetMonday);
+        nextMonday.setDate(targetMonday.getDate() + 7);
+
+        ordersToProcess = await prisma.order.findMany({
+          where: {
+            createdAt: {
+              gte: targetMonday,
+              lt: nextMonday,
+            },
+            status: { in: ['PENDING', 'CONFIRMED', 'IN_PRODUCTION', 'BAKED'] },
+          },
+          include: {
+            items: {
+              include: {
+                productVariant: {
+                  include: {
+                    product: true,
+                    recipe: true,
+                  },
+                },
+              },
+            },
+          },
+        });
+      }
     }
 
     // Accumulators for ingredients
