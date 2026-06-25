@@ -108,13 +108,15 @@ model OrderItem {
   productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
   quantity         Int
   couponApplied    Int            @default(0)
+  priceOverride    Float?
 }
 
 model Batch {
-  id        String      @id @default(uuid())
-  date      DateTime    @default(now())
-  status    String      @default("DRAFT") // DRAFT, LOCKED
-  orders    Order[]
+  id           String      @id @default(uuid())
+  date         DateTime    @default(now())
+  status       String      @default("DRAFT") // DRAFT, LOCKED
+  ordersClosed Boolean     @default(false)
+  orders       Order[]
 }
 
 model StandingOrder {

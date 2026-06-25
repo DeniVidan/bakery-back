@@ -72,7 +72,7 @@ router.get('/status', authenticateToken, requireApproved, async (req: Authentica
           productName: item.productVariant.product.name,
           size: item.productVariant.size,
           quantity: item.quantity,
-          price: item.productVariant.price,
+          price: (item as any).priceOverride !== null && (item as any).priceOverride !== undefined ? (item as any).priceOverride : item.productVariant.price,
           couponApplied: item.couponApplied || 0
         } as any);
       });

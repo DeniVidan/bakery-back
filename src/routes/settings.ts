@@ -17,6 +17,14 @@ router.get('/', async (req, res) => {
     if (!dict['bakingDays']) {
       dict['bakingDays'] = JSON.stringify(['Tuesday', 'Saturday']);
     }
+
+    // Fetch all batches where orders are closed
+    const closedBatches = await prisma.batch.findMany({
+      where: { ordersClosed: true },
+      select: { date: true }
+    });
+    const closedDates = closedBatches.map(b => b.date.toISOString().split('T')[0]);
+    dict['closedDates'] = JSON.stringify(closedDates);
     
     return res.json({ settings: dict });
   } catch (error) {

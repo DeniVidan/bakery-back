@@ -348,7 +348,7 @@ router.post('/batches', authenticateToken, requireAdmin, async (req: Authenticat
       include: {
         orders: {
           include: {
-            user: { select: { name: true, email: true } },
+            user: { select: { id: true, name: true, email: true, phone: true } },
             items: {
               include: {
                 productVariant: {
@@ -376,24 +376,28 @@ router.post('/batches', authenticateToken, requireAdmin, async (req: Authenticat
 
 // 3. Get all batches
 router.get('/batches', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  const { light } = req.query;
   try {
-    const batches = await prisma.batch.findMany({
-      include: {
-        orders: {
-          include: {
-            items: {
-              include: {
-                productVariant: {
-                  include: {
-                    product: true,
-                    recipe: true,
-                  },
+    const include = light === 'true' ? undefined : {
+      orders: {
+        include: {
+          user: { select: { id: true, name: true, email: true, phone: true } },
+          items: {
+            include: {
+              productVariant: {
+                include: {
+                  product: true,
+                  recipe: true,
                 },
               },
             },
           },
         },
       },
+    };
+
+    const batches = await prisma.batch.findMany({
+      include,
       orderBy: { date: 'desc' },
     });
     return res.json({ batches });
@@ -413,7 +417,7 @@ router.get('/batches/:id', authenticateToken, requireAdmin, async (req: Authenti
       include: {
         orders: {
           include: {
-            user: { select: { name: true, email: true, phone: true } },
+            user: { select: { id: true, name: true, email: true, phone: true } },
             items: {
               include: {
                 productVariant: {
@@ -485,9 +489,54 @@ async function adjustPantryStockForBatch(batchId: string, action: 'deduct' | 're
       },
     });
 
+    // Fetch settings needed for starter calculation
+    const startersSetting = await prisma.setting.findUnique({ where: { key: 'starters' } });
+    const wasteFactorSetting = await prisma.setting.findUnique({ where: { key: 'starterWasteFactor' } });
+    const seedSetting = await prisma.setting.findUnique({ where: { key: 'availableStarterSeed' } });
+    const reserveSetting = await prisma.setting.findUnique({ where: { key: 'starterReserve' } });
+    const ratioSetting = await prisma.setting.findUnique({ where: { key: 'starterPresetRatio' } });
+
+    let configuredStarters: any[] = [];
+    if (startersSetting && startersSetting.value) {
+      try {
+        configuredStarters = JSON.parse(startersSetting.value);
+      } catch (e) {
+        console.error("Error parsing starters setting:", e);
+      }
+    }
+
+    const starterWasteFactor = wasteFactorSetting ? parseFloat(wasteFactorSetting.value) : 5.0; // default 5%
+
+    let availableStarterSeed: Record<string, number> = {};
+    if (seedSetting && seedSetting.value) {
+      try {
+        availableStarterSeed = JSON.parse(seedSetting.value);
+      } catch (e) {
+        console.error("Error parsing availableStarterSeed:", e);
+      }
+    }
+
+    let starterReserve: Record<string, number> = {};
+    if (reserveSetting && reserveSetting.value) {
+      try {
+        starterReserve = JSON.parse(reserveSetting.value);
+      } catch (e) {
+        console.error("Error parsing starterReserve:", e);
+      }
+    }
+
+    let starterPresetRatio: Record<string, string> = {};
+    if (ratioSetting && ratioSetting.value) {
+      try {
+        starterPresetRatio = JSON.parse(ratioSetting.value);
+      } catch (e) {
+        console.error("Error parsing starterPresetRatio:", e);
+      }
+    }
+
     // 2. Aggregate all ingredients used in this batch
     let saltGrams = 0;
-    let starterGrams = 0;
+    const startersMap: Record<string, number> = {}; // starterName -> grams
     const floursMap: Record<string, number> = {}; // ingredientName -> grams
     const extrasMap: Record<string, number> = {}; // ingredientName -> grams
 
@@ -498,7 +547,11 @@ async function adjustPantryStockForBatch(batchId: string, action: 'deduct' | 're
 
         const qty = item.quantity;
         saltGrams += (recipe.salt || 0) * qty;
-        starterGrams += (recipe.starter || 0) * qty;
+
+        // Accumulate required starters by name
+        const sName = (!recipe.starterName || recipe.starterName === 'default') ? 'Standard Sourdough Starter' : recipe.starterName;
+        const sGrams = (recipe.starter || 0) * qty;
+        startersMap[sName] = (startersMap[sName] || 0) + sGrams;
 
         // Total flour weight for this recipe variant
         const flourWeight = (recipe.flour || 0) * qty;
@@ -543,6 +596,56 @@ async function adjustPantryStockForBatch(batchId: string, action: 'deduct' | 're
             if (extra && extra.name && typeof extra.grams === 'number') {
               extrasMap[extra.name] = (extrasMap[extra.name] || 0) + extra.grams * qty;
             }
+          }
+        }
+      }
+    }
+
+    // Translate required sourdough starters into raw flours via conservation model (Method A or B)
+    for (const [sName, targetGrams] of Object.entries(startersMap)) {
+      if (targetGrams <= 0) continue;
+
+      const profile = configuredStarters.find(s => s.name === sName);
+      const floursBreakdown = profile?.floursBreakdown || [{ name: 'Bread Flour', percentage: 100 }];
+      const feedingMethod = profile?.feedingMethod || 'method-b';
+
+      const scaledTarget = Math.ceil(targetGrams * (1 + (starterWasteFactor / 100)));
+
+      const getVal = (stateObj: Record<string, any>, keyName: string, defaultVal: any) => {
+        return stateObj[keyName] !== undefined ? stateObj[keyName] : defaultVal;
+      };
+
+      const reserveVal = parseFloat(getVal(starterReserve, sName, 100)) || 0;
+      const seedVal = parseFloat(getVal(availableStarterSeed, sName, 100)) || 0;
+      const totalTarget = scaledTarget + reserveVal;
+
+      let feedFlourGrams = 0;
+
+      if (feedingMethod === 'method-b') {
+        if (seedVal >= totalTarget) {
+          feedFlourGrams = 0;
+        } else {
+          const remainingWeight = totalTarget - seedVal;
+          feedFlourGrams = Math.ceil(remainingWeight / 2);
+        }
+      } else {
+        const currentPresetRatio = getVal(starterPresetRatio, sName, '') || 
+          `${profile?.seedParts || 1}:${profile?.flourParts || 2}:${profile?.waterParts || 2}`;
+        
+        const seedParts = parseInt(currentPresetRatio.split(':')[0], 10) || 1;
+        const flourParts = parseInt(currentPresetRatio.split(':')[1], 10) || 2;
+        const waterParts = parseInt(currentPresetRatio.split(':')[2], 10) || 2;
+        const totalParts = seedParts + flourParts + waterParts;
+
+        const weightPerPart = totalTarget / totalParts;
+        feedFlourGrams = Math.ceil(weightPerPart * flourParts);
+      }
+
+      if (feedFlourGrams > 0) {
+        for (const fb of floursBreakdown) {
+          if (fb && fb.name && typeof fb.percentage === 'number') {
+            const fbGrams = Math.ceil(feedFlourGrams * (fb.percentage / 100));
+            floursMap[fb.name] = (floursMap[fb.name] || 0) + fbGrams;
           }
         }
       }
@@ -596,9 +699,6 @@ async function adjustPantryStockForBatch(batchId: string, action: 'deduct' | 're
 
     // Adjust Salt
     adjustStock("Salt", saltGrams);
-
-    // Adjust Starter
-    adjustStock("Sourdough Starter", starterGrams);
 
     // Adjust Flours
     for (const [flourName, grams] of Object.entries(floursMap)) {
@@ -681,8 +781,8 @@ async function updateBatchStatus(req: AuthenticatedRequest, res: Response) {
       });
     }
 
-    // Deduct/Restore inventory based on transitioning to/from deducted statuses (BAKED or LOCKED)
-    const isDeductedStatus = (s: string) => s === 'BAKED' || s === 'LOCKED';
+    // Deduct/Restore inventory based on transitioning to/from deducted statuses (IN_PRODUCTION, BAKED, LOCKED, or COMPLETED)
+    const isDeductedStatus = (s: string) => s === 'IN_PRODUCTION' || s === 'LOCKED' || s === 'BAKED' || s === 'COMPLETED';
     const oldDeducted = isDeductedStatus(oldStatus);
     const newDeducted = isDeductedStatus(status);
 
@@ -702,6 +802,36 @@ async function updateBatchStatus(req: AuthenticatedRequest, res: Response) {
   }
 }
 
+// 5.2 Toggle batch orders closed status (Limit batch orders)
+router.put('/batches/:id/toggle-orders-limit', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+
+  try {
+    const batch = await prisma.batch.findUnique({
+      where: { id },
+    });
+
+    if (!batch) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+
+    const updated = await prisma.batch.update({
+      where: { id },
+      data: {
+        ordersClosed: !batch.ordersClosed,
+      },
+    });
+
+    return res.json({
+      message: `Batch orders limit toggled successfully to ${updated.ordersClosed}`,
+      batch: updated,
+    });
+  } catch (error) {
+    console.error('Error toggling batch orders limit:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // 5.5 Generic batch status transition
 router.put('/batches/:id/status', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   return updateBatchStatus(req, res);
@@ -716,7 +846,7 @@ router.delete('/batches/:id', authenticateToken, requireAdmin, async (req: Authe
       where: { id },
     });
 
-    const isDeductedStatus = (s: string) => s === 'BAKED' || s === 'LOCKED';
+    const isDeductedStatus = (s: string) => s === 'IN_PRODUCTION' || s === 'LOCKED' || s === 'BAKED' || s === 'COMPLETED';
     if (batchToDelete && isDeductedStatus(batchToDelete.status)) {
       // Restore inventory stock if deleting an active/deducted batch
       await adjustPantryStockForBatch(id, 'restore');

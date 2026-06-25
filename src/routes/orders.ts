@@ -263,6 +263,9 @@ router.post('/', authenticateToken, requireApproved, async (req: AuthenticatedRe
       batchId = await findOrCreateBatchForSlot(pickupSlot);
       const associatedBatch = await prisma.batch.findUnique({ where: { id: batchId } });
       if (associatedBatch) {
+        if (associatedBatch.ordersClosed && req.user.role !== 'ADMIN') {
+          return res.status(400).json({ error: 'This baking date is fully booked. Ordering has been closed.' });
+        }
         if (associatedBatch.status === 'LOCKED') {
           return res.status(400).json({ error: 'This baking day is locked and in production. No new orders can be added.' });
         }
@@ -280,6 +283,7 @@ router.post('/', authenticateToken, requireApproved, async (req: AuthenticatedRe
             productVariantId: item.productVariantId,
             quantity: item.quantity,
             couponApplied: item.couponApplied || 0,
+            priceOverride: item.priceOverride !== undefined && item.priceOverride !== null && item.priceOverride !== "" ? parseFloat(item.priceOverride) : null,
           })),
         },
       },
