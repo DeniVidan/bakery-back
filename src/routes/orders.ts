@@ -377,7 +377,7 @@ router.put('/:id/status', authenticateToken, requireAdmin, async (req: Authentic
 // 3.5 Update order details (Admin only, e.g. for changing pickupSlot/baking date)
 router.put('/:id', authenticateToken, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
-  const { pickupSlot, status, batchId } = req.body;
+  const { pickupSlot, status, batchId, items } = req.body;
 
   try {
     const existingOrder = await prisma.order.findUnique({
@@ -387,6 +387,31 @@ router.put('/:id', authenticateToken, requireAdmin, async (req: AuthenticatedReq
 
     if (!existingOrder) {
       return res.status(404).json({ error: 'Order not found' });
+    }
+
+    // Process order item price override or quantity updates if provided
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (item.id) {
+          const itemUpdateData: any = {};
+          if (item.priceOverride !== undefined) {
+            if (item.priceOverride === null || item.priceOverride === '') {
+              itemUpdateData.priceOverride = null;
+            } else {
+              const val = typeof item.priceOverride === 'string' ? parseFloat(item.priceOverride) : item.priceOverride;
+              itemUpdateData.priceOverride = isNaN(val) ? null : val;
+            }
+          }
+          if (item.quantity !== undefined) {
+            const qty = typeof item.quantity === 'string' ? parseInt(item.quantity) : item.quantity;
+            itemUpdateData.quantity = isNaN(qty) || qty <= 0 ? 1 : qty;
+          }
+          await prisma.orderItem.update({
+            where: { id: item.id },
+            data: itemUpdateData
+          });
+        }
+      }
     }
 
     // Immutable batch lock safeguard for existing batch (Admins can bypass)
